@@ -481,7 +481,7 @@ def parseDynamicImports(contents):
         # Matches dynamic imports stored in a string to tuple map: { str: [num, num] } (Ex { "./showcase_en-US.yaml": [18539, 8539], }).
         # String map key seems to be the asset it might help load. First tuple number might be chunk id and last is the js filename.
         # If it's an svg, we need to download this asset, otherwise the yaml files seem like they're inlined in the js chunk file or not needed
-        match = re.findall(r'var\s+n\s*=\s*\{((?:\s*"[^"]+":\s*\[\d+,\s*\d+\],?)+)\s*\}', content, re.X)
+        match = re.findall(r'var\s+\w+\s*=\s*\{((?:\s*"[^"]+":\s*\[\d+,\s*\d+\],?)+)\s*\}', content, re.X)
 
         for m in match:
             innerMatches = re.finditer(r'"([^"]+)":\[\d+,(\d+)\]', m, re.X)
@@ -582,7 +582,7 @@ async def downloadAssets(base, base_page_text):
     if showcase_runtime_filename is None:
         raise Exception("In all js files found on the page could not find any that have showcase and runtime in the filename for the showcase runtime js file")
     if react_vendor_filename is None:
-        raise Exception("In all js files found on the page could not find any that have vendors-react in the filename for the react vendor js file")
+        consoleDebugLog("No vendors-react file on the page, will look for the react code by content after downloading the js files")
     await downloadFile("STATIC_ASSET", True, "https://matterport.com/nextjs-assets/images/favicon.ico", "favicon.ico")  # mainly to avoid the 404, always matterport.com
     showcase_cont = await downloadFileAndGetText(typeDict[showcase_runtime_filename], True, base + showcase_runtime_filename, showcase_runtime_filename, always_download=CLA.getCommandLineArg(CommandLineArg.REFRESH_KEY_FILES))
     showcase_main_cont = await downloadFileAndGetText(typeDict[MAIN_SHOWCASE_FILENAME], True, base + MAIN_SHOWCASE_FILENAME, MAIN_SHOWCASE_FILENAME, always_download=CLA.getCommandLineArg(CommandLineArg.REFRESH_KEY_FILES))
@@ -676,14 +676,58 @@ async def downloadAssets(base, base_page_text):
         shouldExist = True
         toDownload.append(AsyncDownloadItem(type, shouldExist, f"{base}{asset}", local_file))
     await AsyncArrayDownload(toDownload)
-    if react_vendor_filename and os.path.exists(react_vendor_filename):
-        reactCont = ""
-        with open(react_vendor_filename, "r", encoding="UTF-8") as f:
-            reactCont = f.read()
 
-        reactCont = reactCont.replace("(t.src=s.src)", '(t.src=""+(t.src??s.src))')  # hacky but in certain conditions react will try to reset the source on something after it loads to re-trigger the load event but this breaks jsnetproxy.  This allows the same triggering but uses the existing source if it exists. https://github.com/facebook/react/blob/37906d4dfbe80d71f312f7347bb9ddb930484d28/packages/react-dom-bindings/src/client/ReactFiberConfigDOM.js#L744. Right now this seems to only happens on embedded attachments.
-        with open(getModifiedName(react_vendor_filename), "w", encoding="UTF-8") as f:
-            f.write(reactCont)
+    # The downloaded chunks themselves can reference more chunks (ex: the locale yaml map in a chunk), so keep scanning new files until nothing new turns up
+    scanned_js: set[str] = set()
+    while True:
+        chunk_contents: list[str] = []
+        for asset in list(assets):
+            if asset.startswith("js/") and asset.endswith(".js") and asset not in scanned_js and os.path.exists(asset):
+                scanned_js.add(asset)
+                with open(asset, "r", encoding="UTF-8", errors="ignore") as f:
+                    chunk_contents.append(f.read())
+        if not chunk_contents:
+            break
+        chunk_js_files, chunk_image_files = parseDynamicImports(chunk_contents)
+        newDownloads: list[AsyncDownloadItem] = []
+        for key in chunk_js_files:
+            file = f"js/{key}.js"
+            if file in typeDict:
+                continue
+            typeDict[file] = "DYNAMIC_IMPORTS_JS"
+            assets.append(file)
+            newDownloads.append(AsyncDownloadItem(typeDict[file], True, f"{base}{file}", file))
+        for image in chunk_image_files:
+            file = "images/" + image
+            if file in typeDict:
+                continue
+            typeDict[file] = "STATIC_IMAGE"
+            assets.append(file)
+            newDownloads.append(AsyncDownloadItem(typeDict[file], True, f"{base}{file}", file))
+        if newDownloads:
+            await AsyncArrayDownload(newDownloads)
+
+    react_img_patches = [
+        ("(t.src=s.src)", '(t.src=""+(t.src??s.src))'),
+        ("t.src?r.src=t.src:", 't.src?r.src=""+(r.src||t.src):'),  # newer react builds, bundled in a numbered chunk instead of vendors-react
+    ]  # hacky but in certain conditions react will try to reset the source on something after it loads to re-trigger the load event but this breaks jsnetproxy.  This allows the same triggering but uses the existing source if it exists. https://github.com/facebook/react/blob/37906d4dfbe80d71f312f7347bb9ddb930484d28/packages/react-dom-bindings/src/client/ReactFiberConfigDOM.js#L744. Right now this seems to only happens on embedded attachments.
+    react_candidates = [react_vendor_filename] if react_vendor_filename else [a for a in assets if a.startswith("js/") and a.endswith(".js")]
+    patched_react = False
+    for candidate in react_candidates:
+        if not candidate or not os.path.exists(candidate):
+            continue
+        with open(candidate, "r", encoding="UTF-8") as f:
+            reactCont = f.read()
+        patched = reactCont
+        for find, replace in react_img_patches:
+            patched = patched.replace(find, replace)
+        if patched != reactCont:
+            with open(getModifiedName(candidate), "w", encoding="UTF-8") as f:
+                f.write(patched)
+            patched_react = True
+            consoleDebugLog(f"Patched react image source handling in {candidate}")
+    if not patched_react:
+        consoleLog("Could not find the react image source code to patch, embedded attachments may not display in the archive", logging.WARNING)
     toDownload.clear()
 
 
